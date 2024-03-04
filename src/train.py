@@ -58,7 +58,48 @@ class ReplayBuffer:
         return list(map(lambda x:torch.Tensor(np.array(x)).to(self.device), list(zip(*batch))))
     def __len__(self):
         return len(self.data)
-
+class ParetoReplayBuffer:
+    def __init__(self, capacity, device, parameter):
+        self.capacity = int(capacity) # capacity of the buffer
+        self.index = 0 # index of the next cell to be filled
+        self.device = device
+        self.data = []
+        self.generator = lambda x: np.random.default_rng().pareto(parameter, size = x)
+        self.parameter = parameter
+    def append(self, s, a, r, s_, d):
+        if len(self.data) < self.capacity:
+            self.data.append(None)
+        self.data[self.index] = (s, a, r, s_, d)
+        self.index = (self.index + 1) % self.capacity
+    def sample(self, batch_size):
+        logits = self.generator(batch_size)
+        indicies = (logits + 1) * len(self.data) *(self.parameter +1)/(2*self.parameter)
+        indicies = indicies.astype(np.int32)
+        indicies = (len(self.data) - indicies)%len(self.data)
+        batch = [self.data[i] for i in indicies]
+        return list(map(lambda x:torch.Tensor(np.array(x)).to(self.device), list(zip(*batch))))
+    def __len__(self):
+        return len(self.data)
+class FullReplayBuffer:
+    def __init__(self, capacity, device):
+        self.capacity = int(capacity) # capacity of the buffer
+        self.index = 0 # index of the next cell to be filled
+        self.device = device
+        self.data = []
+    def append(self, s, a, r, s_, d):
+        if len(self.data) < self.capacity:
+            self.data.append(None)
+        self.data[self.index] = (s, a, r, s_, d)
+        self.index = (self.index + 1) % self.capacity
+    def sample(self, batch_size):
+        batch = random.sample(self.data, batch_size)
+        return list(map(lambda x:torch.Tensor(np.array(x)).to(self.device), list(zip(*batch))))
+    def generate(self, batch_size):
+        order = np.random.permutation(len(self.data)//batch_size)
+        for i in order:
+            yield list(map(lambda x:torch.Tensor(np.array(x)).to(self.device), list(zip(*self.data[i*batch_size:(i+1)*batch_size]))))
+    def __len__(self):
+        return len(self.data)
 def collect_samples(env, horizon=200, disable_tqdm=False, print_done_states=False):
     s, _ = env.reset()
     #dataset = []
@@ -177,7 +218,8 @@ class dqn_agent:
         self.gamma = config['gamma'] if 'gamma' in config.keys() else 0.95
         self.batch_size = config['batch_size'] if 'batch_size' in config.keys() else 100
         buffer_size = config['buffer_size'] if 'buffer_size' in config.keys() else int(1e5)
-        self.memory = ReplayBuffer(buffer_size,device)
+        parameter = config['parameter'] if 'parameter' in config.keys() else 0
+        self.memory = ParetoReplayBuffer(buffer_size,device,parameter) if parameter > 0 else ReplayBuffer(buffer_size, device)
         self.epsilon_max = config['epsilon_max'] if 'epsilon_max' in config.keys() else 1.
         self.epsilon_min = config['epsilon_min'] if 'epsilon_min' in config.keys() else 0.01
         self.epsilon_stop = config['epsilon_decay_period'] if 'epsilon_decay_period' in config.keys() else 1000
@@ -193,6 +235,7 @@ class dqn_agent:
         self.update_target_freq = config['update_target_freq'] if 'update_target_freq' in config.keys() else 20
         self.update_target_tau = config['update_target_tau'] if 'update_target_tau' in config.keys() else 0.005
         self.monitoring_nb_trials = config['monitoring_nb_trials'] if 'monitoring_nb_trials' in config.keys() else 0
+        self.gradient_type = config['gradient_type'] if 'gradient_type' in config.keys() else None
 
     def MC_eval(self, env, nb_trials):   # NEW NEW NEW
         MC_total_reward = []
@@ -223,16 +266,28 @@ class dqn_agent:
                 val.append(self.model(torch.Tensor(x).unsqueeze(0).to(device)).max().item())
         return np.mean(val)
     
-    def gradient_step(self):
-        if len(self.memory) > self.batch_size:
-            X, A, R, Y, D = self.memory.sample(self.batch_size)
-            QYmax = self.target_model(Y).max(1)[0].detach()
-            update = torch.addcmul(R, 1-D, QYmax, value=self.gamma)
-            QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
-            loss = self.criterion(QXA, update.unsqueeze(1))
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step() 
+    def gradient_step(self, type=None):
+        if type == "full":
+            if len(self.memory) > self.batch_size:
+                for batch in self.memory.generate(self.batch_size):
+                    X, A, R, Y, D = batch
+                    QYmax = self.target_model(Y).max(1)[0].detach()
+                    update = torch.addcmul(R, 1-D, QYmax, value=self.gamma)
+                    QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
+                    loss = self.criterion(QXA, update.unsqueeze(1))
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+        else:
+            if len(self.memory) > self.batch_size:
+                X, A, R, Y, D = self.memory.sample(self.batch_size)
+                QYmax = self.target_model(Y).max(1)[0].detach()
+                update = torch.addcmul(R, 1-D, QYmax, value=self.gamma)
+                QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
+                loss = self.criterion(QXA, update.unsqueeze(1))
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step() 
     
     def train(self, env, max_episode):
         episode_return = []
@@ -259,7 +314,7 @@ class dqn_agent:
             episode_cum_reward += reward
             # train
             for _ in range(self.nb_gradient_steps): 
-                self.gradient_step()
+                self.gradient_step(self.gradient_type)
             # update target network if needed
             if self.update_target_strategy == 'replace':
                 if step % self.update_target_freq == 0: 
@@ -319,8 +374,6 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # device = "cpu"
 DQN = torch.nn.Sequential(nn.Linear(state_dim, nb_neurons),
                           nn.ReLU(),
-                          nn.Linear(nb_neurons, nb_neurons),
-                          nn.ReLU(), 
                           nn.Linear(nb_neurons, nb_neurons),
                           nn.ReLU(), 
                           nn.Linear(nb_neurons, n_action)).to(device)
@@ -434,22 +487,40 @@ if __name__ == "__main__":
     config = {'nb_actions': n_action,
                 'learning_rate': 5e-4,
                 'gamma': 0.95,
-                'buffer_size': 2048*40,
+                'buffer_size': 2048*5,
                 'epsilon_min': 0.05,
                 'epsilon_max': 1,
                 'epsilon_decay_period': 200*50,
                 'epsilon_delay_decay': 200*10,
                 'batch_size': 2048,
-                'gradient_steps': 40,
+                'gradient_steps': 80,
                 'update_target_strategy': 'ema', # or 'ema'
                 'update_target_freq': 20,
-                'update_target_tau': 0.005,
+                'update_target_tau': 0.01,
                 'criterion': torch.nn.SmoothL1Loss(),
-                'monitoring_nb_trials': 0}
+                'monitoring_nb_trials': 0,
+                'parameter': 0}
+    # config = {'nb_actions': n_action,
+    #             'learning_rate': 5e-4,
+    #             'gamma': 0.95,
+    #             'buffer_size': 2048*20,
+    #             'epsilon_min': 0.05,
+    #             'epsilon_max': 1,
+    #             'epsilon_decay_period': 200*30,
+    #             'epsilon_delay_decay': 200*5,
+    #             'batch_size': 2048,
+    #             'gradient_steps': 10,
+    #             'update_target_strategy': 'ema', # or 'ema'
+    #             'update_target_freq': 10,
+    #             'update_target_tau': 0.05,
+    #             'criterion': torch.nn.SmoothL1Loss(),
+    #             'monitoring_nb_trials': 0,
+    #             'parameter': 0,
+    #             'gradient_type': "full"}
 
     # Train agent
     agent = dqn_agent(config, DQN)
-    ep_length, disc_rewards, tot_rewards, V0 = agent.train(env, 1000)
+    ep_length, disc_rewards, tot_rewards, V0 = agent.train(env, 500)
     agent.save("src/dqn.pkl")
     payload = pickle.load(open("src/dqn.pkl", "rb"))
     model = payload["target_model"]
