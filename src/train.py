@@ -235,6 +235,7 @@ class dqn_agent:
         self.update_target_freq = config['update_target_freq'] if 'update_target_freq' in config.keys() else 20
         self.update_target_tau = config['update_target_tau'] if 'update_target_tau' in config.keys() else 0.005
         self.monitoring_nb_trials = config['monitoring_nb_trials'] if 'monitoring_nb_trials' in config.keys() else 0
+        self.gradient_type = config['gradient_type'] if 'gradient_type' in config.keys() else None
 
     def MC_eval(self, env, nb_trials):   # NEW NEW NEW
         MC_total_reward = []
@@ -277,15 +278,16 @@ class dqn_agent:
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
-        if len(self.memory) > self.batch_size:
-            X, A, R, Y, D = self.memory.sample(self.batch_size)
-            QYmax = self.target_model(Y).max(1)[0].detach()
-            update = torch.addcmul(R, 1-D, QYmax, value=self.gamma)
-            QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
-            loss = self.criterion(QXA, update.unsqueeze(1))
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step() 
+        else:
+            if len(self.memory) > self.batch_size:
+                X, A, R, Y, D = self.memory.sample(self.batch_size)
+                QYmax = self.target_model(Y).max(1)[0].detach()
+                update = torch.addcmul(R, 1-D, QYmax, value=self.gamma)
+                QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
+                loss = self.criterion(QXA, update.unsqueeze(1))
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step() 
     
     def train(self, env, max_episode):
         episode_return = []
@@ -312,7 +314,7 @@ class dqn_agent:
             episode_cum_reward += reward
             # train
             for _ in range(self.nb_gradient_steps): 
-                self.gradient_step()
+                self.gradient_step(self.gradient_type)
             # update target network if needed
             if self.update_target_strategy == 'replace':
                 if step % self.update_target_freq == 0: 
@@ -480,43 +482,45 @@ if __name__ == "__main__":
             'criterion': torch.nn.SmoothL1Loss(),
             'monitoring_nb_trials': 3}
     config = {'nb_actions': n_action,
-                'learning_rate': 1e-3,
+                'learning_rate': 5e-4,
                 'gamma': 0.95,
-                'buffer_size': 2048*20,
+                'buffer_size': 2048*5,
                 'epsilon_min': 0.05,
                 'epsilon_max': 1,
                 'epsilon_decay_period': 200*30,
                 'epsilon_delay_decay': 200*5,
                 'batch_size': 2048,
-                'gradient_steps': 10,
+                'gradient_steps': 80,
                 'update_target_strategy': 'ema', # or 'ema'
-                'update_target_freq': 10,
-                'update_target_tau': 0.0005,
-                'criterion': torch.nn.SmoothL1Loss(),
-                'monitoring_nb_trials': 0,
-                'parameter': 0.5}
-    config = {'nb_actions': n_action,
-                'learning_rate': 1e-3,
-                'gamma': 0.95,
-                'buffer_size': 2048*20,
-                'epsilon_min': 0.05,
-                'epsilon_max': 1,
-                'epsilon_decay_period': 200*30,
-                'epsilon_delay_decay': 200*5,
-                'batch_size': 2048,
-                'gradient_steps': "full",
-                'update_target_strategy': 'ema', # or 'ema'
-                'update_target_freq': 10,
-                'update_target_tau': 0.0005,
+                'update_target_freq': 20,
+                'update_target_tau': 0.01,
                 'criterion': torch.nn.SmoothL1Loss(),
                 'monitoring_nb_trials': 0,
                 'parameter': 0}
+    # config = {'nb_actions': n_action,
+    #             'learning_rate': 5e-4,
+    #             'gamma': 0.95,
+    #             'buffer_size': 2048*20,
+    #             'epsilon_min': 0.05,
+    #             'epsilon_max': 1,
+    #             'epsilon_decay_period': 200*30,
+    #             'epsilon_delay_decay': 200*5,
+    #             'batch_size': 2048,
+    #             'gradient_steps': 10,
+    #             'update_target_strategy': 'ema', # or 'ema'
+    #             'update_target_freq': 10,
+    #             'update_target_tau': 0.05,
+    #             'criterion': torch.nn.SmoothL1Loss(),
+    #             'monitoring_nb_trials': 0,
+    #             'parameter': 0,
+    #             'gradient_type': "full"}
 
     # Train agent
     agent = dqn_agent(config, DQN)
-    ep_length, disc_rewards, tot_rewards, V0 = agent.train(env, 301)
+    ep_length, disc_rewards, tot_rewards, V0 = agent.train(env, 500)
     agent.save("src/dqn.pkl")
     payload = pickle.load(open("src/dqn.pkl", "rb"))
     model = payload["target_model"]
     torch.save(model.state_dict(), "src/dqn.pth")
+
     
